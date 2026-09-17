@@ -1,0 +1,185 @@
+name: Claude On-Demand (@claude)
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  respond:
+    name: Respond to @claude mention
+    runs-on: ubuntu-latest
+    # Only run if @claude is mentioned
+    if: contains(github.event.comment.body, '@claude')
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get context
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine if this is an issue or PR
+          if [ "${{ github.event.issue.pull_request }}" != "" ]; then
+            echo "type=pr" >> $GITHUB_OUTPUT
+            PR_NUM=${{ github.event.issue.number }}
+
+            # Get PR details and diff
+            gh pr view $PR_NUM --json title,body,author,headRefName > pr_info.json
+            gh pr diff $PR_NUM > pr_diff.txt
+
+            # Limit diff size
+            if [ $(wc -c < pr_diff.txt) -gt 30000 ]; then
+              head -c 30000 pr_diff.txt > pr_diff_truncated.txt
+              mv pr_diff_truncated.txt pr_diff.txt
+            fi
+          else
+            echo "type=issue" >> $GITHUB_OUTPUT
+            ISSUE_NUM=${{ github.event.issue.number }}
+
+            # Get issue details
+            gh issue view $ISSUE_NUM --json title,body,author > issue_info.json
+          fi
+
+          # Get recent comments for context
+          COMMENTS=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments | jq -r '.[-5:] | .[] | "**\(.user.login)**: \(.body)"')
+          echo "$COMMENTS" > recent_comments.txt
+
+      - name: Extract request from comment
+        id: request
+        run: |
+          # Get the comment body
+          COMMENT_BODY='${{ github.event.comment.body }}'
+
+          # Remove @claude mention and clean up
+          REQUEST=$(echo "$COMMENT_BODY" | sed 's/@claude//g' | sed 's/^[ \t]*//')
+
+          # If empty request, use default
+          if [ -z "$REQUEST" ]; then
+            REQUEST="Please review this and provide your insights."
+          fi
+
+          echo "request=$REQUEST" >> $GITHUB_OUTPUT
+          echo "$REQUEST" > user_request.txt
+
+      - name: Build context for Claude
+        id: build_context
+        run: |
+          CONTEXT_TYPE=${{ steps.context.outputs.type }}
+
+          if [ "$CONTEXT_TYPE" == "pr" ]; then
+            # PR context
+            PR_INFO=$(cat pr_info.json)
+            PR_TITLE=$(echo "$PR_INFO" | jq -r '.title')
+            PR_BODY=$(echo "$PR_INFO" | jq -r '.body')
+            PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author.login')
+            PR_BRANCH=$(echo "$PR_INFO" | jq -r '.headRefName')
+            PR_DIFF=$(cat pr_diff.txt)
+
+            cat > context.txt <<EOF
+          # Pull Request Context
+          - **Title**: $PR_TITLE
+          - **Author**: @$PR_AUTHOR
+          - **Branch**: $PR_BRANCH
+          - **PR**: #${{ github.event.issue.number }}
+
+          ## PR Description
+          $PR_BODY
+
+          ## Code Changes
+          \`\`\`diff
+          $PR_DIFF
+          \`\`\`
+
+          ## Recent Discussion
+          $(cat recent_comments.txt)
+          EOF
+          else
+            # Issue context
+            ISSUE_INFO=$(cat issue_info.json)
+            ISSUE_TITLE=$(echo "$ISSUE_INFO" | jq -r '.title')
+            ISSUE_BODY=$(echo "$ISSUE_INFO" | jq -r '.body')
+            ISSUE_AUTHOR=$(echo "$ISSUE_INFO" | jq -r '.author.login')
+
+            cat > context.txt <<EOF
+          # Issue Context
+          - **Title**: $ISSUE_TITLE
+          - **Author**: @$ISSUE_AUTHOR
+          - **Issue**: #${{ github.event.issue.number }}
+
+          ## Issue Description
+          $ISSUE_BODY
+
+          ## Recent Discussion
+          $(cat recent_comments.txt)
+          EOF
+          fi
+
+      - name: Call Claude API
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          USER_REQUEST=$(cat user_request.txt)
+          CONTEXT=$(cat context.txt)
+
+          # Create request payload
+          cat > request.json <<EOF
+          {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
+            "messages": [
+              {
+                "role": "user",
+                "content": "You are Claude, an AI assistant helping with code review and technical discussions on GitHub.\n\n**User Request**: $USER_REQUEST\n\n**Context**:\n$CONTEXT\n\nProvide a helpful, specific response. Use GitHub markdown. Be concise but thorough. If reviewing code, mention specific lines or patterns. If discussing an issue, provide actionable suggestions."
+              }
+            ]
+          }
+          EOF
+
+          # Call Claude API
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @request.json)
+
+          # Extract response
+          CLAUDE_RESPONSE=$(echo "$RESPONSE" | jq -r '.content[0].text')
+
+          # Check if API call was successful
+          if [ -z "$CLAUDE_RESPONSE" ] || [ "$CLAUDE_RESPONSE" == "null" ]; then
+            CLAUDE_RESPONSE="⚠️ Sorry, I encountered an error processing your request. Please try again or check that the ANTHROPIC_API_KEY is configured correctly."
+          fi
+
+          echo "$CLAUDE_RESPONSE" > response.txt
+
+      - name: Post response
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESPONSE=$(cat response.txt)
+
+          # Post response as comment
+          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
+            -f body="$RESPONSE
+
+---
+*🤖 Invoked by @${{ github.event.comment.user.login }} • Powered by Claude Sonnet 4*"
+
+          echo "✅ Response posted"
+
+      - name: Add reaction to trigger comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Add 🤖 reaction to show we processed the request
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content=robot

@@ -4,6 +4,7 @@ import App from './App.vue'
 import Dashboard from './views/Dashboard.vue'
 import Inventory from './views/Inventory.vue'
 import Orders from './views/Orders.vue'
+import Backlog from './views/Backlog.vue'
 import Demand from './views/Demand.vue'
 import Spending from './views/Spending.vue'
 import Reports from './views/Reports.vue'
@@ -14,8 +15,9 @@ const router = createRouter({
     { path: '/', component: Dashboard },
     { path: '/inventory', component: Inventory },
     { path: '/orders', component: Orders },
-    { path: '/demand', component: Demand },
+    { path: '/backlog', component: Backlog },
     { path: '/spending', component: Spending },
+    { path: '/demand', component: Demand },
     { path: '/reports', component: Reports }
   ]
 })
