@@ -1,0 +1,100 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the PR diff
+          gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
+
+          # Limit diff size (Claude API has token limits)
+          if [ $(wc -c < pr_diff.txt) -gt 50000 ]; then
+            echo "⚠️ PR diff too large, truncating to 50KB"
+            head -c 50000 pr_diff.txt > pr_diff_truncated.txt
+            mv pr_diff_truncated.txt pr_diff.txt
+          fi
+
+          # Save diff for next step
+          cat pr_diff.txt
+
+      - name: Review with Claude API
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Read the diff
+          DIFF=$(cat pr_diff.txt)
+
+          # Create request payload
+          cat > request.json <<EOF
+          {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
+            "messages": [
+              {
+                "role": "user",
+                "content": "You are a senior software engineer conducting a code review. Review this pull request diff and provide:\n\n1. **Summary**: Brief overview of changes\n2. **Strengths**: What's done well\n3. **Issues**: Bugs, security concerns, or problems (if any)\n4. **Suggestions**: Improvements for code quality, performance, or maintainability\n5. **Approval**: Recommend 'Approve', 'Request Changes', or 'Comment'\n\nBe constructive and specific. Use GitHub markdown formatting.\n\n## Pull Request Details\n- Title: ${{ github.event.pull_request.title }}\n- Author: @${{ github.event.pull_request.user.login }}\n- Branch: ${{ github.head_ref }}\n\n## Code Diff\n\`\`\`diff\n${DIFF}\n\`\`\`"
+              }
+            ]
+          }
+          EOF
+
+          # Call Claude API
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @request.json)
+
+          # Extract review content
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text')
+
+          # Save review for next step
+          echo "$REVIEW" > review.txt
+
+          # Check if API call was successful
+          if [ -z "$REVIEW" ] || [ "$REVIEW" == "null" ]; then
+            echo "❌ Claude API call failed"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ Review generated successfully"
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read the review
+          REVIEW=$(cat review.txt)
+
+          # Post as PR comment
+          gh pr comment ${{ github.event.pull_request.number }} --body "## 🤖 AI Code Review by Claude
+
+$REVIEW
+
+---
+*Powered by Claude Sonnet 4 via GitHub Actions*
+*Review triggered by: ${{ github.event.action }}*"
+
+          echo "✅ Review posted to PR #${{ github.event.pull_request.number }}"
